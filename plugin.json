@@ -1,0 +1,13 @@
+{
+  "id": "hostsSSH",
+  "name": "Hosts SSH",
+  "description": "Quick SSH launcher for hosts from /etc/hosts",
+  "version": "1.0.0",
+  "author": "Hansi",
+  "icon": "terminal",
+  "type": "widget",
+  "capabilities": ["dankbar-widget"],
+  "component": "./MHostsWidget.qml",
+  "settings": "./MHostsSettings.qml",
+  "permissions": ["settings_read", "settings_write", "process"]
+}
