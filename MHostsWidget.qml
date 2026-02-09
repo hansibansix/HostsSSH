@@ -885,7 +885,7 @@ PluginComponent {
             detailsText: root.hostPrefix ? 
                 root.hostCount + " hosts with '" + root.hostPrefix + "' prefix" :
                 root.hostCount + " hosts"
-            showCloseButton: true
+            showCloseButton: false
 
             // Track selected index for keyboard navigation
             property int selectedIndex: -1
