@@ -32,11 +32,25 @@ PluginComponent {
     property var hostsList: []
     property int hostCount: hostsList.length
     property string searchQuery: ""
+
+    // Cached canonical hostnames (first alias per unique IP) — rebuilt when hostsList changes
+    property var canonicalHosts: new Set()
+    onHostsListChanged: {
+        let ipToHost = {};
+        for (let host of hostsList) {
+            if (!ipToHost[host.ip]) ipToHost[host.ip] = host.name;
+        }
+        canonicalHosts = new Set(Object.values(ipToHost));
+    }
     
     // Repo search mode
     property bool isRepoSearch: searchQuery.startsWith(repoSearchPrefix) && repoSearchPrefix !== ""
     property string repoSearchQuery: isRepoSearch ? searchQuery.slice(repoSearchPrefix.length).toLowerCase() : ""
     
+    // Shared delegate heights for scroll calculations
+    readonly property int hostDelegateHeight: 48
+    readonly property int repoDelegateHeight: 44
+
     // Trigger fetching all repos when entering repo search mode
     onIsRepoSearchChanged: {
         if (isRepoSearch) {
@@ -111,22 +125,18 @@ PluginComponent {
     // Process to load cache
     Process {
         id: repoCacheLoader
-        property var outputLines: []
+        property string output: ""
 
         command: ["cat", root.cacheFilePath]
 
         stdout: SplitParser {
-            onRead: line => {
-                let lines = repoCacheLoader.outputLines.slice();
-                lines.push(line);
-                repoCacheLoader.outputLines = lines;
-            }
+            onRead: line => { repoCacheLoader.output += line; }
         }
 
         onExited: (exitCode) => {
-            if (exitCode === 0 && outputLines.length > 0) {
+            if (exitCode === 0 && output) {
                 try {
-                    const cache = JSON.parse(outputLines.join(""));
+                    const cache = JSON.parse(output);
                     let newState = {};
                     for (let hostname in cache) {
                         newState[hostname] = {
@@ -137,14 +147,20 @@ PluginComponent {
                         };
                     }
                     root.gitReposState = newState;
+                    // Check existence of all cached repos
+                    for (let hostname in cache) {
+                        if (cache[hostname].length > 0) {
+                            root.checkAllReposExist(hostname, cache[hostname]);
+                        }
+                    }
                 } catch (e) {
                     console.log("Failed to parse repos cache: " + e);
                 }
             }
-            outputLines = [];
+            output = "";
         }
     }
-    
+
     // Save cache (debounced) - only call when repo data actually changes, not on UI state changes
     Timer {
         id: cacheSaveTimer
@@ -156,12 +172,17 @@ PluginComponent {
         cacheSaveTimer.restart();
     }
     
-    // Track which repos already exist in clone directory
+    // Track which repos already exist in clone directory (keyed by folder name)
     property var existingRepos: ({})
+
+    // Derive the on-disk folder name from a repo path (e.g. "group/project.git" -> "project")
+    function repoFolder(repoName) {
+        return repoName.split("/").pop().replace(/\.git$/, "");
+    }
 
     // Check if a repo exists in the clone directory (single repo, e.g. after clone)
     function checkRepoExists(hostname, repoName, forceRecheck) {
-        const key = hostname + ":" + repoName;
+        const key = repoFolder(repoName);
         if (!forceRecheck && existingRepos.hasOwnProperty(key)) return;
         // Remove stale entry so checkAllReposExist's filter won't skip it
         if (forceRecheck && existingRepos.hasOwnProperty(key)) {
@@ -172,22 +193,41 @@ PluginComponent {
         checkAllReposExist(hostname, [repoName]);
     }
 
+    // Queue of repos pending existence check
+    property var repoCheckQueue: []
+
     // Batch-check all repos for a host in a single process invocation
     function checkAllReposExist(hostname, repos) {
         if (repos.length === 0) return;
-        // Filter out already-checked repos
-        let toCheck = repos.filter(r => !existingRepos.hasOwnProperty(hostname + ":" + r));
+        // Filter out already-checked repos and add to queue
+        let toCheck = repos.filter(r => !existingRepos.hasOwnProperty(repoFolder(r)));
         if (toCheck.length === 0) return;
+        repoCheckQueue = repoCheckQueue.concat(toCheck);
+        processRepoCheckQueue();
+    }
 
-        repoExistsChecker.hostname = hostname;
-        repoExistsChecker.checkRepos = toCheck;
-        repoExistsChecker.outputLines = [];
+    function processRepoCheckQueue() {
+        if (repoExistsChecker.running || repoCheckQueue.length === 0) return;
+
+        // Deduplicate by folder name
+        let seen = new Set();
+        let batch = [];
+        for (let r of repoCheckQueue) {
+            const folder = repoFolder(r);
+            if (!seen.has(folder) && !existingRepos.hasOwnProperty(folder)) {
+                seen.add(folder);
+                batch.push(r);
+            }
+        }
+        repoCheckQueue = [];
+        if (batch.length === 0) return;
+
+        repoExistsChecker.checkRepos = batch;
+        repoExistsChecker.output = "";
 
         const cloneDir = root.cloneDir;
-        // Build a shell script that checks each repo dir and prints Y or N per line
-        let checks = toCheck.map(r => {
-            const folderName = r.split("/").pop().replace(/\.git$/, "");
-            return 'test -d "' + cloneDir + '/' + folderName + '" && echo Y || echo N';
+        let checks = batch.map(r => {
+            return 'test -d "' + cloneDir + '/' + repoFolder(r) + '" && echo Y || echo N';
         }).join("; ");
         repoExistsChecker.command = ["sh", "-c", checks];
         repoExistsChecker.running = true;
@@ -195,25 +235,24 @@ PluginComponent {
 
     Process {
         id: repoExistsChecker
-        property string hostname: ""
         property var checkRepos: []
-        property var outputLines: []
+        property string output: ""
 
         stdout: SplitParser {
-            onRead: line => {
-                let lines = repoExistsChecker.outputLines.slice();
-                lines.push(line.trim());
-                repoExistsChecker.outputLines = lines;
-            }
+            onRead: line => { repoExistsChecker.output += line.trim() + "\n"; }
         }
 
         onExited: (exitCode) => {
+            const lines = output.trim().split("\n");
             let newExisting = Object.assign({}, root.existingRepos);
             for (let i = 0; i < checkRepos.length; i++) {
-                const key = hostname + ":" + checkRepos[i];
-                newExisting[key] = (i < outputLines.length && outputLines[i] === "Y");
+                const key = root.repoFolder(checkRepos[i]);
+                newExisting[key] = (i < lines.length && lines[i] === "Y");
             }
             root.existingRepos = newExisting;
+            output = "";
+            // Process any queued checks that arrived while running
+            root.processRepoCheckQueue();
         }
     }
     
@@ -302,8 +341,7 @@ PluginComponent {
                 hostListView.forceLayout();
                 
                 // Since all other repos are collapsed, calculate Y position
-                // Each host item is 48px + spacing
-                const hostHeight = 48;
+                const hostHeight = root.hostDelegateHeight;
                 const spacing = hostListView.spacing;
                 
                 const yPos = hostIndex * (hostHeight + spacing);
@@ -336,7 +374,7 @@ PluginComponent {
     
     // Function to clone a repo (runs in background)
     function cloneGitRepo(hostname, repoName) {
-        const cloneKey = hostname + ":" + repoName;
+        const cloneKey = repoFolder(repoName);
 
         // Prevent duplicate clones
         if (activeClones[cloneKey]) {
@@ -378,7 +416,7 @@ PluginComponent {
     }
     
     function onCloneFinished(hostname, repoName, success, errorMsg) {
-        const cloneKey = hostname + ":" + repoName;
+        const cloneKey = repoFolder(repoName);
         
         // Remove from active clones
         let newActive = Object.assign({}, activeClones);
@@ -516,9 +554,10 @@ PluginComponent {
     function fetchAllHostRepos() {
         if (isFetchingAllRepos) return;
 
-        // Build queue of hosts that haven't been fetched yet (skip cached, loading, and errored)
+        // Build queue of canonical hosts that haven't been fetched yet
         let queue = [];
         for (let host of hostsList) {
+            if (!canonicalHosts.has(host.name)) continue;
             const state = gitReposState[host.name];
             if (state && (state.repos.length > 0 || state.loading || state.error)) {
                 continue;
@@ -635,17 +674,21 @@ PluginComponent {
         }
 
         let results = [];
+        let seenRepos = new Set();
         for (let hostname in gitReposState) {
             const state = gitReposState[hostname];
-            if (state.repos && state.repos.length > 0) {
-                for (let repoName of state.repos) {
-                    if (repoName.toLowerCase().includes(repoSearchQuery)) {
-                        results.push({
-                            hostname: hostname,
-                            repoName: repoName,
-                            repoKey: hostname + ":" + repoName
-                        });
-                    }
+            if (!state.repos || state.repos.length === 0) continue;
+            // Skip non-canonical aliases to avoid duplicate repos
+            if (!canonicalHosts.has(hostname)) continue;
+            for (let repoName of state.repos) {
+                if (seenRepos.has(repoName)) continue;
+                if (repoName.toLowerCase().includes(repoSearchQuery)) {
+                    seenRepos.add(repoName);
+                    results.push({
+                        hostname: hostname,
+                        repoName: repoName,
+                        repoKey: repoFolder(repoName)
+                    });
                 }
             }
         }
@@ -692,30 +735,23 @@ PluginComponent {
             return ["sh", "-c", awkScript];
         }
 
-        property var outputLines: []
+        property string output: ""
 
         stdout: SplitParser {
             onRead: line => {
-                if (line.trim()) {
-                    let lines = hostsReader.outputLines.slice();
-                    lines.push(line.trim());
-                    hostsReader.outputLines = lines;
-                }
+                if (line.trim()) hostsReader.output += line.trim() + "\n";
             }
         }
 
         onExited: (exitCode) => {
-            if (exitCode === 0) {
-                const hosts = outputLines.map(line => {
+            if (exitCode === 0 && output) {
+                const hosts = output.trim().split("\n").map(line => {
                     const parts = line.split("|");
-                    return {
-                        name: parts[0] || "",
-                        ip: parts[1] || ""
-                    };
+                    return { name: parts[0] || "", ip: parts[1] || "" };
                 }).filter(h => h.name);
                 root.hostsList = hosts;
             }
-            outputLines = [];
+            output = "";
         }
     }
 
@@ -914,9 +950,8 @@ PluginComponent {
                 if (!delegateItem) return;
                 
                 // Calculate the Y position of the selected repo within the list
-                // Host item height (48) + spacing + repo items before selected
-                const hostHeight = 48;
-                const repoHeight = 44;
+                const hostHeight = root.hostDelegateHeight;
+                const repoHeight = root.repoDelegateHeight;
                 const spacing = Theme.spacingS;
                 
                 const repoY = delegateItem.y + hostHeight + spacing + (selectedRepoIndex * (repoHeight + spacing));
@@ -1064,9 +1099,9 @@ PluginComponent {
                                         const hostname = root.filteredHosts[popoutColumn.selectedIndex].name;
                                         const state = popoutColumn.getSelectedHostRepoState();
                                         const repoName = state.repos[popoutColumn.selectedRepoIndex];
-                                        const repoKey = hostname + ":" + repoName;
+                                        const folderKey = root.repoFolder(repoName);
                                         // Only clone if not already cloned and not currently cloning
-                                        if (!root.existingRepos[repoKey] && !root.activeClones[repoKey]) {
+                                        if (!root.existingRepos[folderKey] && !root.activeClones[folderKey]) {
                                             root.cloneGitRepo(hostname, repoName);
                                         }
                                     }
@@ -1336,7 +1371,7 @@ PluginComponent {
                         StyledRect {
                             id: hostDelegate
                             width: parent.width
-                            height: 48
+                            height: root.hostDelegateHeight
                             radius: Theme.cornerRadius
 
                             property bool isSelected: index === popoutColumn.selectedIndex
@@ -1465,7 +1500,7 @@ PluginComponent {
                             StyledRect {
                                 visible: hostDelegateColumn.repoState.loading
                                 width: parent.width
-                                height: 44
+                                height: root.repoDelegateHeight
                                 radius: Theme.cornerRadius
                                 color: Theme.surfaceContainer
                                 
@@ -1499,7 +1534,7 @@ PluginComponent {
                             StyledRect {
                                 visible: !hostDelegateColumn.repoState.loading && hostDelegateColumn.repoState.error
                                 width: parent.width
-                                height: 44
+                                height: root.repoDelegateHeight
                                 radius: Theme.cornerRadius
                                 color: Theme.errorContainer
                                 
@@ -1518,10 +1553,10 @@ PluginComponent {
                                 StyledRect {
                                     id: repoItem
                                     width: reposColumn.width
-                                    height: 44
+                                    height: root.repoDelegateHeight
                                     radius: Theme.cornerRadius
 
-                                    property string repoKey: hostDelegateColumn.hostData.name + ":" + modelData
+                                    property string repoKey: root.repoFolder(modelData)
                                     property bool repoExists: root.existingRepos[repoKey] === true
                                     property bool isCloning: root.activeClones[repoKey] === true
                                     property bool isSelected: index === popoutColumn.selectedRepoIndex &&
