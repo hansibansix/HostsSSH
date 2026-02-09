@@ -141,6 +141,12 @@ PluginComponent {
     function checkRepoExists(hostname, repoName, forceRecheck) {
         const key = hostname + ":" + repoName;
         if (!forceRecheck && existingRepos.hasOwnProperty(key)) return;
+        // Remove stale entry so checkAllReposExist's filter won't skip it
+        if (forceRecheck && existingRepos.hasOwnProperty(key)) {
+            let updated = Object.assign({}, existingRepos);
+            delete updated[key];
+            existingRepos = updated;
+        }
         checkAllReposExist(hostname, [repoName]);
     }
 
@@ -416,7 +422,7 @@ PluginComponent {
     // Queue for fetching repos from all hosts
     property var repoFetchQueue: []
     property bool isFetchingAllRepos: false
-    property int maxConcurrentFetchers: 4
+    property int maxConcurrentFetchers: 8
 
     // Parse SSH output into repo names
     function parseRepoOutput(output) {
@@ -472,11 +478,11 @@ PluginComponent {
     function fetchAllHostRepos() {
         if (isFetchingAllRepos) return;
 
-        // Build queue of hosts that haven't been fetched yet
+        // Build queue of hosts that haven't been fetched yet (skip cached, loading, and errored)
         let queue = [];
         for (let host of hostsList) {
             const state = gitReposState[host.name];
-            if (state && (state.repos.length > 0 || state.loading)) {
+            if (state && (state.repos.length > 0 || state.loading || state.error)) {
                 continue;
             }
             queue.push(host.name);
@@ -504,19 +510,29 @@ PluginComponent {
             return;
         }
 
-        for (let i = 0; i < repoFetcherPool.count; i++) {
+        // Batch: collect all hosts to start, then do a single state update
+        let hostsToStart = [];
+        for (let i = 0; i < repoFetcherPool.count && repoFetchQueue.length > 0; i++) {
             const fetcher = repoFetcherPool.objectAt(i);
-            if (!fetcher.running && repoFetchQueue.length > 0) {
+            if (!fetcher.running) {
                 let newQueue = repoFetchQueue.slice();
                 const hostname = newQueue.shift();
                 repoFetchQueue = newQueue;
+                hostsToStart.push({ fetcher: fetcher, hostname: hostname });
+            }
+        }
 
-                // Mark as loading
-                let newState = Object.assign({}, gitReposState);
-                newState[hostname] = { loading: true, repos: [], error: "", expanded: false };
-                gitReposState = newState;
+        if (hostsToStart.length > 0) {
+            // Single state update for all new hosts
+            let newState = Object.assign({}, gitReposState);
+            for (let item of hostsToStart) {
+                newState[item.hostname] = { loading: true, repos: [], error: "", expanded: false };
+            }
+            gitReposState = newState;
 
-                fetcher.startFetch(hostname, true);
+            // Start all fetchers after state is updated
+            for (let item of hostsToStart) {
+                item.fetcher.startFetch(item.hostname, true);
             }
         }
     }
@@ -536,7 +552,7 @@ PluginComponent {
                 hostname = host;
                 isGlobalFetch = global;
                 output = "";
-                command = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "git@" + host];
+                command = ["ssh", "-o", "ConnectTimeout=2", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "git@" + host];
                 running = true;
             }
 
@@ -1349,7 +1365,7 @@ PluginComponent {
                                 DankIcon {
                                     name: "computer"
                                     size: Theme.iconSize
-                                    color: hostDelegate.isSelected ? Theme.onPrimaryContainer : Theme.primary
+                                    color: Theme.primary
                                     anchors.verticalCenter: parent.verticalCenter
 
                                     Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
@@ -1364,7 +1380,7 @@ PluginComponent {
                                         text: hostDelegateColumn.hostData.name
                                         font.pixelSize: Theme.fontSizeMedium
                                         font.weight: Font.Medium
-                                        color: hostDelegate.isSelected ? Theme.onPrimaryContainer : Theme.surfaceText
+                                        color: Theme.surfaceText
 
                                         Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
                                     }
@@ -1372,7 +1388,7 @@ PluginComponent {
                                     StyledText {
                                         text: hostDelegateColumn.hostData.ip
                                         font.pixelSize: Theme.fontSizeSmall
-                                        color: hostDelegate.isSelected ? Theme.onPrimaryContainer : Theme.surfaceVariantText
+                                        color: Theme.surfaceVariantText
 
                                         Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
                                     }
@@ -1707,7 +1723,7 @@ PluginComponent {
                                     text: repoSearchDelegate.repoData.repoName + (repoSearchDelegate.isCloning ? " (cloning...)" : "")
                                     font.pixelSize: Theme.fontSizeMedium
                                     font.weight: Font.Medium
-                                    color: repoSearchDelegate.isSelected ? Theme.onSecondaryContainer : Theme.surfaceText
+                                    color: Theme.surfaceText
                                     elide: Text.ElideMiddle
                                     width: parent.width
 
@@ -1717,7 +1733,7 @@ PluginComponent {
                                 StyledText {
                                     text: repoSearchDelegate.repoData.hostname
                                     font.pixelSize: Theme.fontSizeSmall
-                                    color: repoSearchDelegate.isSelected ? Theme.onSecondaryContainer : Theme.surfaceVariantText
+                                    color: Theme.surfaceVariantText
                                     elide: Text.ElideRight
                                     width: parent.width
 
