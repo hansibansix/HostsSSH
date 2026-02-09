@@ -25,6 +25,9 @@ PluginComponent {
     property string cloneDirectory: pluginData.cloneDirectory || ""
     property string repoSearchPrefix: pluginData.repoSearchPrefix || "!"
 
+    // Computed clone directory (fallback to home)
+    property string cloneDir: cloneDirectory || homeDir
+
     // State
     property var hostsList: []
     property int hostCount: hostsList.length
@@ -43,6 +46,25 @@ PluginComponent {
     
     // Git repos state: { "hostname": { loading: bool, repos: [], error: string, expanded: bool } }
     property var gitReposState: ({})
+
+    // Cached repo stats (avoids O(n) reduce on every state change in UI bindings)
+    property int totalRepoCount: 0
+    property int searchedHostCount: 0
+
+    onGitReposStateChanged: {
+        // Update cached stats
+        let repos = 0;
+        let hosts = 0;
+        for (let h in gitReposState) {
+            hosts++;
+            const s = gitReposState[h];
+            if (s.repos) repos += s.repos.length;
+        }
+        totalRepoCount = repos;
+        searchedHostCount = hosts;
+        // Refresh repo search results
+        if (isRepoSearch) repoSearchDebounce.restart();
+    }
     
     // Save repos cache to file
     function saveReposCache() {
@@ -161,7 +183,7 @@ PluginComponent {
         repoExistsChecker.checkRepos = toCheck;
         repoExistsChecker.outputLines = [];
 
-        const cloneDir = root.cloneDirectory || root.homeDir;
+        const cloneDir = root.cloneDir;
         // Build a shell script that checks each repo dir and prints Y or N per line
         let checks = toCheck.map(r => {
             const folderName = r.split("/").pop().replace(/\.git$/, "");
@@ -298,7 +320,9 @@ PluginComponent {
     function collapseAllRepos() {
         let newState = Object.assign({}, gitReposState);
         for (let hostname in newState) {
-            newState[hostname] = Object.assign({}, newState[hostname], { expanded: false });
+            if (newState[hostname].expanded) {
+                newState[hostname] = Object.assign({}, newState[hostname], { expanded: false });
+            }
         }
         gitReposState = newState;
         expandedCount = 0;
@@ -307,29 +331,31 @@ PluginComponent {
     // Track active clone operations: { "hostname:repoName": true }
     property var activeClones: ({})
     
-    // Clone queue: [{hostname, repoName, cloneUrl, cloneDir}, ...]
+    // Clone queue: [{hostname, repoName, cloneUrl}, ...]
     property var cloneQueue: []
     
     // Function to clone a repo (runs in background)
     function cloneGitRepo(hostname, repoName) {
-        const cloneUrl = "git@" + hostname + ":" + repoName;
-        const cloneDir = root.cloneDirectory || root.homeDir;
         const cloneKey = hostname + ":" + repoName;
-        
+
         // Prevent duplicate clones
         if (activeClones[cloneKey]) {
             ToastService.showInfo("Already cloning " + repoName, "");
             return;
         }
-        
+
         // Mark as active
         let newActive = Object.assign({}, activeClones);
         newActive[cloneKey] = true;
         activeClones = newActive;
-        
+
         // Add to queue
         let newQueue = cloneQueue.slice();
-        newQueue.push({hostname: hostname, repoName: repoName, cloneUrl: cloneUrl, cloneDir: cloneDir});
+        newQueue.push({
+            hostname: hostname,
+            repoName: repoName,
+            cloneUrl: "git@" + hostname + ":" + repoName
+        });
         cloneQueue = newQueue;
         
         ToastService.showInfo("Cloning: " + repoName, "");
@@ -342,12 +368,11 @@ PluginComponent {
     
     function processNextClone() {
         if (cloneQueue.length === 0) return;
-        
+
         const item = cloneQueue[0];
         gitCloneProcess.hostname = item.hostname;
         gitCloneProcess.repoName = item.repoName;
         gitCloneProcess.cloneUrl = item.cloneUrl;
-        gitCloneProcess.cloneDir = item.cloneDir;
         gitCloneProcess.errorLines = [];
         gitCloneProcess.running = true;
     }
@@ -385,11 +410,10 @@ PluginComponent {
         property string hostname: ""
         property string repoName: ""
         property string cloneUrl: ""
-        property string cloneDir: ""
         property var errorLines: []
 
         command: ["git", "clone", cloneUrl]
-        workingDirectory: cloneDir
+        workingDirectory: root.cloneDir
 
         stderr: SplitParser {
             onRead: line => {
@@ -474,6 +498,20 @@ PluginComponent {
         onTriggered: root.fillFetcherPool()
     }
 
+    // Force re-fetch repos from all hosts (clears cache first)
+    function refreshAllRepos() {
+        // Wait for current fetches to finish
+        if (isFetchingAllRepos) return;
+
+        // Clear all cached repo data
+        gitReposState = {};
+        existingRepos = {};
+        repoFetchQueue = [];
+
+        // Re-fetch
+        fetchAllHostRepos();
+    }
+
     // Fetch repos from all hosts (for global repo search)
     function fetchAllHostRepos() {
         if (isFetchingAllRepos) return;
@@ -512,15 +550,14 @@ PluginComponent {
 
         // Batch: collect all hosts to start, then do a single state update
         let hostsToStart = [];
-        for (let i = 0; i < repoFetcherPool.count && repoFetchQueue.length > 0; i++) {
+        let queue = repoFetchQueue.slice();
+        for (let i = 0; i < repoFetcherPool.count && queue.length > 0; i++) {
             const fetcher = repoFetcherPool.objectAt(i);
             if (!fetcher.running) {
-                let newQueue = repoFetchQueue.slice();
-                const hostname = newQueue.shift();
-                repoFetchQueue = newQueue;
-                hostsToStart.push({ fetcher: fetcher, hostname: hostname });
+                hostsToStart.push({ fetcher: fetcher, hostname: queue.shift() });
             }
         }
+        repoFetchQueue = queue;
 
         if (hostsToStart.length > 0) {
             // Single state update for all new hosts
@@ -575,16 +612,11 @@ PluginComponent {
             }
         }
     }
-    
 
     // Filtered hosts based on search (empty in repo search mode)
     property var filteredHosts: {
-        if (isRepoSearch) {
-            return [];
-        }
-        if (!searchQuery || searchQuery.trim() === "") {
-            return hostsList;
-        }
+        if (isRepoSearch) return [];
+        if (!searchQuery.trim()) return hostsList;
         const query = searchQuery.toLowerCase();
         return hostsList.filter(host => 
             host.name.toLowerCase().includes(query) || 
@@ -621,9 +653,6 @@ PluginComponent {
     }
 
     onRepoSearchQueryChanged: repoSearchDebounce.restart()
-    onGitReposStateChanged: {
-        if (isRepoSearch) repoSearchDebounce.restart();
-    }
 
     Timer {
         id: repoSearchDebounce
@@ -692,152 +721,117 @@ PluginComponent {
 
     // SSH connection function
     function connectToHost(hostname) {
-        let sshTarget = hostname;
-        if (root.sshUser && root.sshUser !== "") {
-            sshTarget = root.sshUser + "@" + hostname;
-        }
+        const sshTarget = (root.sshUser ? root.sshUser + "@" : "") + hostname;
 
         if (root.terminal === "kitty") {
-            // For kitty: first find the running kitty PID to construct socket path
             kittyPidFinder.sshTarget = sshTarget;
             kittyPidFinder.hostname = hostname;
             kittyPidFinder.running = true;
         } else {
-            const terminalCmd = buildTerminalCommand(sshTarget);
-            Quickshell.execDetached(terminalCmd);
+            Quickshell.execDetached(buildTerminalCommand(sshTarget));
             ToastService.showInfo("SSH", "Connecting to " + hostname);
+        }
+    }
+
+    // Build the shell command that runs SSH with a "press enter to exit" prompt
+    function buildSshCmd(sshTarget) {
+        return "ssh " + sshTarget + "; echo; echo 'Connection closed. Press Enter to exit.'; read";
+    }
+
+    // Launch a new kitty window (fallback when no socket/tab support)
+    function launchKittyWindow(hostname, sshTarget) {
+        Quickshell.execDetached(["kitty", "--title", hostname, "sh", "-c", buildSshCmd(sshTarget)]);
+        ToastService.showInfo("SSH", "Connecting to " + hostname);
+    }
+
+    function buildTerminalCommand(sshTarget) {
+        const fullCmd = buildSshCmd(sshTarget);
+        switch (root.terminal) {
+            case "foot":       return ["foot", "-e", "sh", "-c", fullCmd];
+            case "alacritty":  return ["alacritty", "-e", "sh", "-c", fullCmd];
+            case "wezterm":    return ["wezterm", "start", "--", "sh", "-c", fullCmd];
+            case "gnome-terminal": return ["gnome-terminal", "--", "sh", "-c", fullCmd];
+            case "konsole":    return ["konsole", "-e", "sh", "-c", fullCmd];
+            default:           return [root.terminal, "-e", "sh", "-c", fullCmd];
         }
     }
 
     // Kitty socket base name from settings (without PID)
     property string kittySocketBase: pluginData.kittySocket || "unix:@mykitty"
 
-    // Find kitty PID to construct full socket path
+    // Kitty tab support: pgrep → check socket → launch tab (or fallback to new window)
     Process {
         id: kittyPidFinder
         property string sshTarget: ""
         property string hostname: ""
-        
+        property string kittyPid: ""
+
         command: ["pgrep", "-x", "kitty"]
 
         stdout: SplitParser {
-            onRead: line => {
-                if (line.trim()) {
-                    kittyPidFinder.kittyPid = line.trim();
-                }
-            }
+            onRead: line => { if (line.trim()) kittyPidFinder.kittyPid = line.trim(); }
         }
-
-        property string kittyPid: ""
 
         onExited: (exitCode) => {
             if (exitCode === 0 && kittyPid) {
-                // Kitty is running, try to connect with PID-based socket
                 kittyChecker.sshTarget = sshTarget;
                 kittyChecker.hostname = hostname;
                 kittyChecker.kittyPid = kittyPid;
                 kittyChecker.running = true;
             } else {
-                // No kitty running, start new instance
-                Quickshell.execDetached([
-                    "kitty", 
-                    "--title", hostname,
-                    "sh", "-c", "ssh " + sshTarget + "; echo; echo 'Connection closed. Press Enter to exit.'; read"
-                ]);
-                ToastService.showInfo("SSH", "Connecting to " + hostname);
+                root.launchKittyWindow(hostname, sshTarget);
             }
             kittyPid = "";
         }
     }
 
-    // Check if kitty accepts remote control on the socket
     Process {
         id: kittyChecker
         property string sshTarget: ""
         property string hostname: ""
         property string kittyPid: ""
-        
-        // Construct socket with PID: unix:@mykitty -> unix:@mykitty-PID
+
         command: ["kitty", "@", "--to", root.kittySocketBase + "-" + kittyPid, "ls"]
 
         onExited: (exitCode) => {
             if (exitCode === 0) {
-                // Kitty is running with remote control, open in new tab
                 kittyLauncher.sshTarget = sshTarget;
                 kittyLauncher.hostname = hostname;
                 kittyLauncher.kittyPid = kittyPid;
                 kittyLauncher.running = true;
             } else {
-                // Socket didn't work, just open new window
-                Quickshell.execDetached([
-                    "kitty",
-                    "--title", hostname,
-                    "sh", "-c", "ssh " + sshTarget + "; echo; echo 'Connection closed. Press Enter to exit.'; read"
-                ]);
-                ToastService.showInfo("SSH", "Connecting to " + hostname);
+                root.launchKittyWindow(hostname, sshTarget);
             }
         }
     }
 
-    // Launch new tab in existing kitty
     Process {
         id: kittyLauncher
         property string sshTarget: ""
         property string hostname: ""
         property string kittyPid: ""
-        
+
         command: [
             "kitty", "@", "--to", root.kittySocketBase + "-" + kittyPid,
             "launch", "--type=tab", "--tab-title", hostname,
-            "sh", "-c", "ssh " + sshTarget + "; echo; echo 'Connection closed. Press Enter to exit.'; read"
+            "sh", "-c", root.buildSshCmd(sshTarget)
         ]
 
         onExited: (exitCode) => {
             if (exitCode === 0) {
                 ToastService.showInfo("SSH", "Opening " + hostname + " in kitty tab");
-                // Focus the kitty window
                 kittyFocuser.kittyPid = kittyPid;
                 kittyFocuser.running = true;
             } else {
-                // Fallback: open new window if tab launch fails
-                Quickshell.execDetached([
-                    "kitty",
-                    "--title", hostname,
-                    "sh", "-c", "ssh " + sshTarget + "; echo; echo 'Connection closed. Press Enter to exit.'; read"
-                ]);
-                ToastService.showInfo("SSH", "Connecting to " + hostname);
+                root.launchKittyWindow(hostname, sshTarget);
             }
         }
     }
 
-    // Focus kitty window after opening tab
     Process {
         id: kittyFocuser
         property string kittyPid: ""
-        
-        command: [
-            "kitty", "@", "--to", root.kittySocketBase + "-" + kittyPid,
-            "focus-window"
-        ]
-    }
-
-    function buildTerminalCommand(sshTarget) {
-        const fullCmd = "ssh " + sshTarget + "; echo; echo 'Connection closed. Press Enter to exit.'; read";
-        
-        switch (root.terminal) {
-            case "foot":
-                return ["foot", "-e", "sh", "-c", fullCmd];
-            case "alacritty":
-                return ["alacritty", "-e", "sh", "-c", fullCmd];
-            case "wezterm":
-                return ["wezterm", "start", "--", "sh", "-c", fullCmd];
-            case "gnome-terminal":
-                return ["gnome-terminal", "--", "sh", "-c", fullCmd];
-            case "konsole":
-                return ["konsole", "-e", "sh", "-c", fullCmd];
-            default:
-                return [root.terminal, "-e", "sh", "-c", fullCmd];
-        }
+        command: ["kitty", "@", "--to", root.kittySocketBase + "-" + kittyPid, "focus-window"]
     }
 
     // Bar pill for horizontal bar
@@ -1656,12 +1650,80 @@ PluginComponent {
                 }
             }
             
+            // Repo search toolbar (visible only in repo search mode)
+            Item {
+                width: parent.width
+                height: root.isRepoSearch ? repoToolbar.height + Theme.spacingS : 0
+                visible: root.isRepoSearch
+
+                Row {
+                    id: repoToolbar
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.margins: Theme.spacingM
+                    height: Theme.iconSize + Theme.spacingS
+                    spacing: Theme.spacingS
+
+                    Rectangle {
+                        width: repoToolbar.height
+                        height: repoToolbar.height
+                        radius: Theme.cornerRadiusSmall
+                        color: refreshRepoArea.containsMouse ? Theme.surfaceContainerHighest : "transparent"
+
+                        Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
+
+                        DankIcon {
+                            name: "refresh"
+                            size: Theme.iconSizeSmall
+                            color: root.isFetchingAllRepos ? Theme.surfaceVariantText : Theme.primary
+                            anchors.centerIn: parent
+
+                            RotationAnimator on rotation {
+                                from: 0
+                                to: 360
+                                duration: 1000
+                                loops: Animation.Infinite
+                                running: root.isFetchingAllRepos
+                            }
+                        }
+
+                        MouseArea {
+                            id: refreshRepoArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: root.isFetchingAllRepos ? Qt.ArrowCursor : Qt.PointingHandCursor
+                            onClicked: {
+                                if (!root.isFetchingAllRepos) {
+                                    root.refreshAllRepos();
+                                }
+                            }
+                        }
+                    }
+
+                    StyledText {
+                        width: parent.width - repoToolbar.height - Theme.spacingS
+                        text: {
+                            if (root.isFetchingAllRepos)
+                                return "Fetching... (" + root.repoFetchQueue.length + " remaining)";
+                            if (root.totalRepoCount > 0)
+                                return root.totalRepoCount + " repos from " + root.searchedHostCount + " hosts";
+                            return "No repos cached";
+                        }
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceVariantText
+                        elide: Text.ElideRight
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+            }
+
             // Repo search results (visible only in repo search mode)
             Item {
                 width: parent.width
                 visible: root.isRepoSearch
-                implicitHeight: root.isRepoSearch ? (root.popoutHeight - popoutColumn.headerHeight - 
-                               popoutColumn.detailsHeight - 60 - Theme.spacingXL - 48) : 0
+                implicitHeight: root.isRepoSearch ? (root.popoutHeight - popoutColumn.headerHeight -
+                               popoutColumn.detailsHeight - 60 - Theme.spacingXL - 48 -
+                               repoToolbar.height - Theme.spacingS) : 0
 
                 ListView {
                     id: repoSearchListView
@@ -1825,7 +1887,7 @@ PluginComponent {
                             StyledText {
                                 visible: !root.isFetchingAllRepos
                                 text: root.repoSearchQuery ? 
-                                      "Searched " + Object.keys(root.gitReposState).length + " hosts" :
+                                      "Searched " + root.searchedHostCount + " hosts" :
                                       "Repos will be fetched from all hosts"
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: Theme.surfaceVariantText
