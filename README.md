@@ -7,11 +7,12 @@ A DankBar widget plugin for DankMaterialShell that provides quick SSH access to 
 - Parses `/etc/hosts` for entries with a configurable prefix (or all hosts if prefix is empty)
 - Displays host count in the bar
 - Click to open a searchable popout with all matching hosts
-- Fuzzy search by hostname or IP address
+- Shows host aliases from `/etc/hosts` alongside each entry (e.g. `server09, m-havelland`)
+- Search by hostname, IP address, or alias
 - Keyboard navigation (↑/↓/Tab to navigate, Enter to connect, Escape to close)
 - Click any host to open an SSH connection in your terminal
 - Kitty users: opens in a new tab if kitty is already running
-- Auto-refreshes host list every 30 seconds
+- Auto-refreshes host list periodically
 
 ## Installation
 
@@ -62,6 +63,7 @@ In Settings → Plugins → Hosts SSH:
 | Host Prefix | Only show hosts starting with this (empty = all hosts) | `m-` |
 | Hosts File Path | Path to hosts file | `/etc/hosts` |
 | Clone Directory | Directory to clone repos into (empty = home) | (empty) |
+| Repo Search Prefix | Prefix to enter repo search mode in the search bar | `!` |
 
 ## Kitty Tab Support
 
@@ -80,12 +82,14 @@ The plugin will automatically detect running kitty instances and open new connec
 ## Example /etc/hosts
 
 ```
-192.168.1.10    m-webserver m-web
-192.168.1.20    m-database m-db
+192.168.1.10    webserver   m-webserver
+192.168.1.20    database    m-database    m-db
 10.0.0.5        dev-server
 10.0.0.10       prod-api
-172.16.0.100    nas storage
+172.16.0.100    nas         m-nas         m-storage
 ```
+
+With prefix `m-`, the plugin picks up `m-webserver`, `m-database`, `m-db`, `m-nas`, and `m-storage`. Each entry shows its other aliases from the same line — for example `m-webserver` displays `192.168.1.10  ·  webserver` and `m-database` displays `192.168.1.20  ·  database, m-db`.
 
 ## Keyboard Navigation
 
@@ -97,6 +101,7 @@ The plugin will automatically detect running kitty instances and open new connec
 | Escape | Clear search / Close popout |
 | Shift+Escape | Clear search, show full list |
 | Super+Enter | Expand/collapse git repos for selected host |
+| Super+Enter (on repo) | Clone the selected repo |
 
 ## Git Repository Browser
 
@@ -110,7 +115,7 @@ The plugin can fetch and display git repositories from hosts running Gitea, Gogs
 **Once expanded:**
 - Click a repo row to clone it to your configured Clone Directory
 - Click the **download icon** (↓) to clone the repo
-- Click the **copy icon** to copy the clone URL to clipboard
+- Repo search results also show host aliases for easy identification
 
 **Requirements:**
 - SSH key authentication set up for `git@hostname`
