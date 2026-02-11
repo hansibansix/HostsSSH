@@ -35,12 +35,17 @@ PluginComponent {
 
     // Cached canonical hostnames (first alias per unique IP) — rebuilt when hostsList changes
     property var canonicalHosts: new Set()
+    // Lookup: hostname -> aliases array
+    property var hostAliasMap: ({})
     onHostsListChanged: {
         let ipToHost = {};
+        let aliasMap = {};
         for (let host of hostsList) {
             if (!ipToHost[host.ip]) ipToHost[host.ip] = host.name;
+            if (host.aliases && host.aliases.length > 0) aliasMap[host.name] = host.aliases;
         }
         canonicalHosts = new Set(Object.values(ipToHost));
+        hostAliasMap = aliasMap;
     }
     
     // Repo search mode
@@ -657,9 +662,10 @@ PluginComponent {
         if (isRepoSearch) return [];
         if (!searchQuery.trim()) return hostsList;
         const query = searchQuery.toLowerCase();
-        return hostsList.filter(host => 
-            host.name.toLowerCase().includes(query) || 
-            host.ip.toLowerCase().includes(query)
+        return hostsList.filter(host =>
+            host.name.toLowerCase().includes(query) ||
+            host.ip.toLowerCase().includes(query) ||
+            (host.aliases && host.aliases.some(a => a.toLowerCase().includes(query)))
         );
     }
     
@@ -727,7 +733,15 @@ PluginComponent {
                     for (i = 2; i <= NF; i++) {
                         if ($i ~ /^#/) break
                         if (prefix == "" || substr($i, 1, length(prefix)) == prefix) {
-                            print $i "|" ip
+                            aliases = ""
+                            for (j = 2; j <= NF; j++) {
+                                if ($j ~ /^#/) break
+                                if (j != i) {
+                                    if (aliases != "") aliases = aliases ","
+                                    aliases = aliases $j
+                                }
+                            }
+                            print $i "|" ip "|" aliases
                         }
                     }
                 }
@@ -747,7 +761,8 @@ PluginComponent {
             if (exitCode === 0 && output) {
                 const hosts = output.trim().split("\n").map(line => {
                     const parts = line.split("|");
-                    return { name: parts[0] || "", ip: parts[1] || "" };
+                    const aliases = (parts[2] || "").split(",").filter(a => a.trim());
+                    return { name: parts[0] || "", ip: parts[1] || "", aliases: aliases };
                 }).filter(h => h.name);
                 root.hostsList = hosts;
             }
@@ -1415,9 +1430,16 @@ PluginComponent {
                                     }
 
                                     StyledText {
-                                        text: hostDelegateColumn.hostData.ip
+                                        text: {
+                                            const aliases = hostDelegateColumn.hostData.aliases;
+                                            if (aliases && aliases.length > 0)
+                                                return hostDelegateColumn.hostData.ip + "  ·  " + aliases.join(", ");
+                                            return hostDelegateColumn.hostData.ip;
+                                        }
                                         font.pixelSize: Theme.fontSizeSmall
                                         color: Theme.surfaceVariantText
+                                        elide: Text.ElideRight
+                                        width: parent.width
 
                                         Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
                                     }
@@ -1828,7 +1850,13 @@ PluginComponent {
                                 }
 
                                 StyledText {
-                                    text: repoSearchDelegate.repoData.hostname
+                                    text: {
+                                        const h = repoSearchDelegate.repoData.hostname;
+                                        const aliases = root.hostAliasMap[h];
+                                        if (aliases && aliases.length > 0)
+                                            return h + "  ·  " + aliases.join(", ");
+                                        return h;
+                                    }
                                     font.pixelSize: Theme.fontSizeSmall
                                     color: Theme.surfaceVariantText
                                     elide: Text.ElideRight
