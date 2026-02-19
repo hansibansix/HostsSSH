@@ -177,6 +177,18 @@ PluginComponent {
         cacheSaveTimer.restart();
     }
     
+    // Immutable state update helpers
+    function setHostExpanded(state, hostname, expanded) {
+        state[hostname] = Object.assign({}, state[hostname], { expanded: expanded });
+    }
+
+    function setCloneActive(cloneKey, active) {
+        let updated = Object.assign({}, activeClones);
+        if (active) updated[cloneKey] = true;
+        else delete updated[cloneKey];
+        activeClones = updated;
+    }
+
     // Track which repos already exist in clone directory (keyed by folder name)
     property var existingRepos: ({})
 
@@ -269,7 +281,7 @@ PluginComponent {
         if (newState[hostname] && newState[hostname].repos && newState[hostname].repos.length > 0) {
             if (newState[hostname].expanded) {
                 // Collapsing this host - reset repo selection and focus host
-                newState[hostname] = Object.assign({}, newState[hostname], { expanded: false });
+                setHostExpanded(newState, hostname, false);
                 gitReposState = newState;
                 expandedCount = Math.max(0, expandedCount - 1);
 
@@ -287,15 +299,13 @@ PluginComponent {
 
         // Collapse all other expanded hosts first
         for (let h in newState) {
-            if (h !== hostname) {
-                newState[h] = Object.assign({}, newState[h], { expanded: false });
-            }
+            if (h !== hostname) setHostExpanded(newState, h, false);
         }
 
         // Check if already loaded
         if (newState[hostname] && newState[hostname].repos && newState[hostname].repos.length > 0) {
             // Expand this host
-            newState[hostname] = Object.assign({}, newState[hostname], { expanded: true });
+            setHostExpanded(newState, hostname, true);
             gitReposState = newState;
             expandedCount = 1;
             scrollToHostAfterExpand(hostname);
@@ -363,9 +373,7 @@ PluginComponent {
     function collapseAllRepos() {
         let newState = Object.assign({}, gitReposState);
         for (let hostname in newState) {
-            if (newState[hostname].expanded) {
-                newState[hostname] = Object.assign({}, newState[hostname], { expanded: false });
-            }
+            if (newState[hostname].expanded) setHostExpanded(newState, hostname, false);
         }
         gitReposState = newState;
         expandedCount = 0;
@@ -381,6 +389,9 @@ PluginComponent {
     function cloneGitRepo(hostname, repoName) {
         const cloneKey = repoFolder(repoName);
 
+        // Already exists on disk
+        if (existingRepos[cloneKey]) return;
+
         // Prevent duplicate clones
         if (activeClones[cloneKey]) {
             ToastService.showInfo("Already cloning " + repoName, "");
@@ -388,9 +399,7 @@ PluginComponent {
         }
 
         // Mark as active
-        let newActive = Object.assign({}, activeClones);
-        newActive[cloneKey] = true;
-        activeClones = newActive;
+        setCloneActive(cloneKey, true);
 
         // Add to queue
         let newQueue = cloneQueue.slice();
@@ -424,9 +433,7 @@ PluginComponent {
         const cloneKey = repoFolder(repoName);
         
         // Remove from active clones
-        let newActive = Object.assign({}, activeClones);
-        delete newActive[cloneKey];
-        activeClones = newActive;
+        setCloneActive(cloneKey, false);
         
         // Remove from queue
         let newQueue = cloneQueue.slice();
@@ -775,9 +782,7 @@ PluginComponent {
         const sshTarget = (root.sshUser ? root.sshUser + "@" : "") + hostname;
 
         if (root.terminal === "kitty") {
-            kittyPidFinder.sshTarget = sshTarget;
-            kittyPidFinder.hostname = hostname;
-            kittyPidFinder.running = true;
+            kittyState.start(hostname, sshTarget);
         } else {
             Quickshell.execDetached(buildTerminalCommand(sshTarget));
             ToastService.showInfo("SSH", "Connecting to " + hostname);
@@ -790,9 +795,9 @@ PluginComponent {
     }
 
     // Launch a new kitty window (fallback when no socket/tab support)
-    function launchKittyWindow(hostname, sshTarget) {
-        Quickshell.execDetached(["kitty", "--title", hostname, "sh", "-c", buildSshCmd(sshTarget)]);
-        ToastService.showInfo("SSH", "Connecting to " + hostname);
+    function launchKittyWindow() {
+        Quickshell.execDetached(["kitty", "--title", kittyState.hostname, "sh", "-c", buildSshCmd(kittyState.sshTarget)]);
+        ToastService.showInfo("SSH", "Connecting to " + kittyState.hostname);
     }
 
     function buildTerminalCommand(sshTarget) {
@@ -810,79 +815,236 @@ PluginComponent {
     // Kitty socket base name from settings (without PID)
     property string kittySocketBase: pluginData.kittySocket || "unix:@mykitty"
 
-    // Kitty tab support: pgrep → check socket → launch tab (or fallback to new window)
-    Process {
-        id: kittyPidFinder
+    // Kitty tab support: shared state for the pgrep → check socket → launch tab chain
+    QtObject {
+        id: kittyState
         property string sshTarget: ""
         property string hostname: ""
         property string kittyPid: ""
 
+        function start(hostname, sshTarget) {
+            kittyState.hostname = hostname;
+            kittyState.sshTarget = sshTarget;
+            kittyState.kittyPid = "";
+            kittyPidFinder.running = true;
+        }
+    }
+
+    Process {
+        id: kittyPidFinder
         command: ["pgrep", "-x", "kitty"]
 
         stdout: SplitParser {
-            onRead: line => { if (line.trim()) kittyPidFinder.kittyPid = line.trim(); }
+            onRead: line => { if (line.trim()) kittyState.kittyPid = line.trim(); }
         }
 
         onExited: (exitCode) => {
-            if (exitCode === 0 && kittyPid) {
-                kittyChecker.sshTarget = sshTarget;
-                kittyChecker.hostname = hostname;
-                kittyChecker.kittyPid = kittyPid;
+            if (exitCode === 0 && kittyState.kittyPid) {
                 kittyChecker.running = true;
             } else {
-                root.launchKittyWindow(hostname, sshTarget);
+                root.launchKittyWindow();
             }
-            kittyPid = "";
         }
     }
 
     Process {
         id: kittyChecker
-        property string sshTarget: ""
-        property string hostname: ""
-        property string kittyPid: ""
-
-        command: ["kitty", "@", "--to", root.kittySocketBase + "-" + kittyPid, "ls"]
+        command: ["kitty", "@", "--to", root.kittySocketBase + "-" + kittyState.kittyPid, "ls"]
 
         onExited: (exitCode) => {
             if (exitCode === 0) {
-                kittyLauncher.sshTarget = sshTarget;
-                kittyLauncher.hostname = hostname;
-                kittyLauncher.kittyPid = kittyPid;
                 kittyLauncher.running = true;
             } else {
-                root.launchKittyWindow(hostname, sshTarget);
+                root.launchKittyWindow();
             }
         }
     }
 
     Process {
         id: kittyLauncher
-        property string sshTarget: ""
-        property string hostname: ""
-        property string kittyPid: ""
-
         command: [
-            "kitty", "@", "--to", root.kittySocketBase + "-" + kittyPid,
-            "launch", "--type=tab", "--tab-title", hostname,
-            "sh", "-c", root.buildSshCmd(sshTarget)
+            "kitty", "@", "--to", root.kittySocketBase + "-" + kittyState.kittyPid,
+            "launch", "--type=tab", "--tab-title", kittyState.hostname,
+            "sh", "-c", root.buildSshCmd(kittyState.sshTarget)
         ]
 
         onExited: (exitCode) => {
             if (exitCode === 0) {
-                ToastService.showInfo("SSH", "Opening " + hostname + " in kitty tab");
-                kittyFocuser.kittyPid = kittyPid;
+                ToastService.showInfo("SSH", "Opening " + kittyState.hostname + " in kitty tab");
                 kittyFocuser.running = true;
             } else {
-                root.launchKittyWindow(hostname, sshTarget);
+                root.launchKittyWindow();
             }
         }
     }
 
     Process {
         id: kittyFocuser
-        property string kittyPid: ""
-        command: ["kitty", "@", "--to", root.kittySocketBase + "-" + kittyPid, "focus-window"]
+        command: ["kitty", "@", "--to", root.kittySocketBase + "-" + kittyState.kittyPid, "focus-window"]
+    }
+
+    // Reusable action bar button component
+    component ActionBarButton: Item {
+        id: actionBtn
+        property bool shown: false
+        property string iconName: ""
+        property string label: ""
+        property color accentColor: Theme.primary
+        property color bgColor: Theme.surfaceContainerHighest
+        property color bgHoverColor: Theme.primaryContainer
+        signal clicked()
+
+        width: parent.width
+        height: shown ? btnRect.height + Theme.spacingS : 0
+        visible: shown
+
+        Behavior on height { NumberAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
+
+        StyledRect {
+            id: btnRect
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: parent.width - Theme.spacingM
+            height: 40
+            radius: Theme.cornerRadius
+            color: btnMouse.containsMouse ? actionBtn.bgHoverColor : actionBtn.bgColor
+
+            Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
+
+            Row {
+                anchors.centerIn: parent
+                spacing: Theme.spacingS
+
+                DankIcon {
+                    name: actionBtn.iconName
+                    size: Theme.iconSizeSmall
+                    color: actionBtn.accentColor
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                StyledText {
+                    text: actionBtn.label
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: actionBtn.accentColor
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+
+            MouseArea {
+                id: btnMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: actionBtn.clicked()
+            }
+        }
+    }
+
+    // Reusable spinning icon component
+    component SpinningIcon: DankIcon {
+        property bool spinning: false
+        RotationAnimator on rotation {
+            from: 0; to: 360; duration: 1000
+            loops: Animation.Infinite; running: spinning
+        }
+    }
+
+    // Reusable repo item delegate
+    component RepoItemDelegate: StyledRect {
+        id: repoDel
+        property string repoName: ""
+        property string subtitle: ""
+        property bool repoExists: false
+        property bool isCloning: false
+        property bool isSelected: false
+        property real iconSize: Theme.iconSizeSmall
+        property real rowSpacing: Theme.spacingS
+        property color baseColor: Theme.surfaceContainer
+        signal cloneRequested()
+        signal entered()
+
+        height: subtitle ? 52 : root.repoDelegateHeight
+        radius: Theme.cornerRadius
+        color: isSelected ? Theme.primaryContainer :
+               bodyMouse.containsMouse ? Theme.surfaceContainerHighest : baseColor
+        border.width: isSelected ? 2 : 0
+        border.color: Theme.secondary
+
+        Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
+        Behavior on border.width { NumberAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
+
+        Row {
+            anchors.fill: parent
+            anchors.margins: Theme.spacingM
+            spacing: repoDel.rowSpacing
+
+            SpinningIcon {
+                name: repoDel.repoExists ? "check_circle" : (repoDel.isCloning ? "sync" : "folder")
+                size: repoDel.iconSize
+                color: repoDel.repoExists ? Theme.primary : (repoDel.isCloning ? Theme.secondary : Theme.surfaceVariantText)
+                anchors.verticalCenter: parent.verticalCenter
+                spinning: repoDel.isCloning
+
+                Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
+            }
+
+            Column {
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: repoDel.subtitle ? 2 : 0
+                width: parent.width - repoDel.iconSize - cloneIcon.width - repoDel.rowSpacing * 2
+
+                StyledText {
+                    text: repoDel.repoName + (repoDel.isCloning ? " (cloning...)" : "")
+                    font.pixelSize: repoDel.subtitle ? Theme.fontSizeMedium : Theme.fontSizeSmall
+                    font.weight: repoDel.subtitle ? Font.Medium : Font.Normal
+                    color: repoDel.isCloning ? Theme.secondary : Theme.surfaceText
+                    elide: Text.ElideMiddle
+                    width: parent.width
+                }
+
+                StyledText {
+                    visible: repoDel.subtitle !== ""
+                    text: repoDel.subtitle
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    elide: Text.ElideRight
+                    width: parent.width
+                }
+            }
+
+            DankIcon {
+                id: cloneIcon
+                visible: !repoDel.repoExists && !repoDel.isCloning
+                name: "download"
+                size: repoDel.iconSize
+                color: cloneMouse.containsMouse ? Theme.primary : Theme.surfaceVariantText
+                anchors.verticalCenter: parent.verticalCenter
+
+                Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
+
+                MouseArea {
+                    id: cloneMouse
+                    anchors.fill: parent
+                    anchors.margins: -Theme.spacingS
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: (mouse) => {
+                        mouse.accepted = true;
+                        repoDel.cloneRequested();
+                    }
+                }
+            }
+        }
+
+        MouseArea {
+            id: bodyMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: (repoDel.repoExists || repoDel.isCloning) ? Qt.ArrowCursor : Qt.PointingHandCursor
+            acceptedButtons: Qt.LeftButton
+            onEntered: repoDel.entered()
+            onClicked: repoDel.cloneRequested()
+        }
     }
 
     // Bar pill for horizontal bar
@@ -1100,9 +1262,7 @@ PluginComponent {
                                 if (root.isRepoSearch) {
                                     if (popoutColumn.selectedIndex >= 0 && popoutColumn.selectedIndex < root.filteredRepos.length) {
                                         const repo = root.filteredRepos[popoutColumn.selectedIndex];
-                                        if (!root.existingRepos[repo.repoKey] && !root.activeClones[repo.repoKey]) {
-                                            root.cloneGitRepo(repo.hostname, repo.repoName);
-                                        }
+                                        root.cloneGitRepo(repo.hostname, repo.repoName);
                                     }
                                     event.accepted = true;
                                     return;
@@ -1114,11 +1274,7 @@ PluginComponent {
                                         const hostname = root.filteredHosts[popoutColumn.selectedIndex].name;
                                         const state = popoutColumn.getSelectedHostRepoState();
                                         const repoName = state.repos[popoutColumn.selectedRepoIndex];
-                                        const folderKey = root.repoFolder(repoName);
-                                        // Only clone if not already cloned and not currently cloning
-                                        if (!root.existingRepos[folderKey] && !root.activeClones[folderKey]) {
-                                            root.cloneGitRepo(hostname, repoName);
-                                        }
+                                        root.cloneGitRepo(hostname, repoName);
                                     }
                                     event.accepted = true;
                                     return;
@@ -1231,6 +1387,15 @@ PluginComponent {
                                     hostListView.positionViewAtIndex(popoutColumn.selectedIndex, ListView.Contain);
                                 }
                             }
+
+                            Keys.onPressed: (event) => {
+                                // Ctrl+R: refresh hosts list and re-fetch all repos
+                                if (event.key === Qt.Key_R && (event.modifiers & Qt.ControlModifier)) {
+                                    hostsReader.running = true;
+                                    root.refreshAllRepos();
+                                    event.accepted = true;
+                                }
+                            }
                         }
 
                         DankIcon {
@@ -1254,106 +1419,27 @@ PluginComponent {
                 }
             }
 
-            // Show All button when search is active
-            Item {
-                width: parent.width
-                height: root.searchQuery ? showAllButton.height + Theme.spacingS : 0
-                visible: root.searchQuery !== ""
-
-                Behavior on height { NumberAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-
-                StyledRect {
-                    id: showAllButton
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    width: parent.width - Theme.spacingM
-                    height: 40
-                    radius: Theme.cornerRadius
-                    color: showAllMouse.containsMouse ? Theme.primaryContainer : Theme.surfaceContainerHighest
-
-                    Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-
-                        DankIcon {
-                            name: "format_list_bulleted"
-                            size: Theme.iconSizeSmall
-                            color: Theme.primary
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-
-                        StyledText {
-                            text: "Show all " + root.hostCount + " hosts"
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.weight: Font.Medium
-                            color: Theme.primary
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-
-                    MouseArea {
-                        id: showAllMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            searchField.text = "";
-                            root.searchQuery = "";
-                            searchField.forceActiveFocus();
-                        }
-                    }
+            ActionBarButton {
+                shown: root.searchQuery !== ""
+                iconName: "format_list_bulleted"
+                label: "Show all " + root.hostCount + " hosts"
+                onClicked: {
+                    searchField.text = "";
+                    root.searchQuery = "";
+                    searchField.forceActiveFocus();
                 }
             }
 
-            // Collapse All button when repos are expanded
-            Item {
-                width: parent.width
-                height: root.hasExpandedRepos ? collapseAllButton.height + Theme.spacingS : 0
-                visible: root.hasExpandedRepos
-
-                Behavior on height { NumberAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-
-                StyledRect {
-                    id: collapseAllButton
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    width: parent.width - Theme.spacingM
-                    height: 40
-                    radius: Theme.cornerRadius
-                    color: collapseAllMouse.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer
-
-                    Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-
-                        DankIcon {
-                            name: "unfold_less"
-                            size: Theme.iconSizeSmall
-                            color: Theme.surfaceVariantText
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-
-                        StyledText {
-                            text: "Collapse all repos"
-                            font.pixelSize: Theme.fontSizeSmall
-                            font.weight: Font.Medium
-                            color: Theme.surfaceVariantText
-                            anchors.verticalCenter: parent.verticalCenter
-                        }
-                    }
-
-                    MouseArea {
-                        id: collapseAllMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            root.collapseAllRepos();
-                            popoutColumn.selectedRepoIndex = -1;
-                        }
-                    }
+            ActionBarButton {
+                shown: root.hasExpandedRepos
+                iconName: "unfold_less"
+                label: "Collapse all repos"
+                accentColor: Theme.surfaceVariantText
+                bgColor: Theme.surfaceContainer
+                bgHoverColor: Theme.surfaceContainerHighest
+                onClicked: {
+                    root.collapseAllRepos();
+                    popoutColumn.selectedRepoIndex = -1;
                 }
             }
 
@@ -1445,23 +1531,16 @@ PluginComponent {
                                     }
                                 }
                                 
-                                DankIcon {
+                                SpinningIcon {
                                     id: gitIcon
                                     name: hostDelegateColumn.repoState.loading ? "sync" :
                                           hostDelegateColumn.isExpanded ? "expand_less" : "expand_more"
                                     size: Theme.iconSizeSmall
                                     color: gitIconMouse.containsMouse ? Theme.primary : Theme.surfaceVariantText
                                     anchors.verticalCenter: parent.verticalCenter
+                                    spinning: hostDelegateColumn.repoState.loading
 
                                     Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-
-                                    RotationAnimator on rotation {
-                                        from: 0
-                                        to: 360
-                                        duration: 1000
-                                        loops: Animation.Infinite
-                                        running: hostDelegateColumn.repoState.loading
-                                    }
                                     
                                     MouseArea {
                                         id: gitIconMouse
@@ -1530,18 +1609,11 @@ PluginComponent {
                                     anchors.centerIn: parent
                                     spacing: Theme.spacingS
                                     
-                                    DankIcon {
+                                    SpinningIcon {
                                         name: "sync"
                                         size: Theme.iconSizeSmall
                                         color: Theme.surfaceVariantText
-                                        
-                                        RotationAnimator on rotation {
-                                            from: 0
-                                            to: 360
-                                            duration: 1000
-                                            loops: Animation.Infinite
-                                            running: hostDelegateColumn.repoState.loading
-                                        }
+                                        spinning: hostDelegateColumn.repoState.loading
                                     }
                                     
                                     StyledText {
@@ -1558,110 +1630,28 @@ PluginComponent {
                                 width: parent.width
                                 height: root.repoDelegateHeight
                                 radius: Theme.cornerRadius
-                                color: Theme.errorContainer
+                                color: Theme.errorHover
                                 
                                 StyledText {
                                     anchors.centerIn: parent
                                     text: hostDelegateColumn.repoState.error
                                     font.pixelSize: Theme.fontSizeSmall
-                                    color: Theme.onErrorContainer
+                                    color: Theme.error
                                 }
                             }
                             
                             // Repos list
                             Repeater {
                                 model: hostDelegateColumn.repoState.repos || []
-                                
-                                StyledRect {
-                                    id: repoItem
+
+                                RepoItemDelegate {
                                     width: reposColumn.width
-                                    height: root.repoDelegateHeight
-                                    radius: Theme.cornerRadius
-
-                                    property string repoKey: root.repoFolder(modelData)
-                                    property bool repoExists: root.existingRepos[repoKey] === true
-                                    property bool isCloning: root.activeClones[repoKey] === true
-                                    property bool isSelected: index === popoutColumn.selectedRepoIndex &&
-                                                              hostDelegateColumn.hostData.name === root.filteredHosts[popoutColumn.selectedIndex]?.name
-
-                                    color: isSelected ? Theme.secondaryContainer :
-                                           repoMouse.containsMouse ? Theme.surfaceContainerHighest : Theme.surfaceContainer
-                                    border.width: isSelected ? 2 : 0
-                                    border.color: Theme.secondary
-
-                                    Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                                    Behavior on border.width { NumberAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-
-                                    Row {
-                                        anchors.fill: parent
-                                        anchors.margins: Theme.spacingM
-                                        spacing: Theme.spacingS
-
-                                        DankIcon {
-                                            name: repoItem.repoExists ? "check_circle" : (repoItem.isCloning ? "sync" : "folder")
-                                            size: Theme.iconSizeSmall
-                                            color: repoItem.repoExists ? Theme.primary : (repoItem.isCloning ? Theme.secondary : Theme.surfaceVariantText)
-                                            anchors.verticalCenter: parent.verticalCenter
-
-                                            Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                                            
-                                            // Rotate animation for cloning state
-                                            RotationAnimation on rotation {
-                                                running: repoItem.isCloning
-                                                from: 0
-                                                to: 360
-                                                duration: 1000
-                                                loops: Animation.Infinite
-                                            }
-                                        }
-                                        
-                                        StyledText {
-                                            id: repoNameText
-                                            text: modelData + (repoItem.isCloning ? " (cloning...)" : "")
-                                            font.pixelSize: Theme.fontSizeSmall
-                                            color: repoItem.isCloning ? Theme.secondary : Theme.surfaceText
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            elide: Text.ElideMiddle
-                                            width: parent.width - Theme.iconSizeSmall - ((repoItem.repoExists || repoItem.isCloning) ? 0 : cloneRepoIcon.width + Theme.spacingS) - Theme.spacingS * 2
-                                        }
-                                        
-                                        DankIcon {
-                                            id: cloneRepoIcon
-                                            visible: !repoItem.repoExists && !repoItem.isCloning
-                                            name: "download"
-                                            size: Theme.iconSizeSmall
-                                            color: cloneRepoMouse.containsMouse ? Theme.primary : Theme.surfaceVariantText
-                                            anchors.verticalCenter: parent.verticalCenter
-
-                                            Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                                            
-                                            MouseArea {
-                                                id: cloneRepoMouse
-                                                anchors.fill: parent
-                                                anchors.margins: -Theme.spacingXS
-                                                hoverEnabled: true
-                                                cursorShape: Qt.PointingHandCursor
-                                                onClicked: (mouse) => {
-                                                    mouse.accepted = true;
-                                                    root.cloneGitRepo(hostDelegateColumn.hostData.name, modelData);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    
-                                    MouseArea {
-                                        id: repoMouse
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: (repoItem.repoExists || repoItem.isCloning) ? Qt.ArrowCursor : Qt.PointingHandCursor
-                                        acceptedButtons: Qt.LeftButton
-                                        
-                                        onClicked: {
-                                            if (!repoItem.repoExists && !repoItem.isCloning) {
-                                                root.cloneGitRepo(hostDelegateColumn.hostData.name, modelData);
-                                            }
-                                        }
-                                    }
+                                    repoName: modelData
+                                    repoExists: root.existingRepos[root.repoFolder(modelData)] === true
+                                    isCloning: root.activeClones[root.repoFolder(modelData)] === true
+                                    isSelected: index === popoutColumn.selectedRepoIndex &&
+                                                hostDelegateColumn.hostData.name === root.filteredHosts[popoutColumn.selectedIndex]?.name
+                                    onCloneRequested: root.cloneGitRepo(hostDelegateColumn.hostData.name, modelData)
                                 }
                             }
                         }
@@ -1729,19 +1719,12 @@ PluginComponent {
 
                         Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
 
-                        DankIcon {
+                        SpinningIcon {
                             name: "refresh"
                             size: Theme.iconSizeSmall
                             color: root.isFetchingAllRepos ? Theme.surfaceVariantText : Theme.primary
                             anchors.centerIn: parent
-
-                            RotationAnimator on rotation {
-                                from: 0
-                                to: 360
-                                duration: 1000
-                                loops: Animation.Infinite
-                                running: root.isFetchingAllRepos
-                            }
+                            spinning: root.isFetchingAllRepos
                         }
 
                         MouseArea {
@@ -1790,123 +1773,22 @@ PluginComponent {
                     spacing: Theme.spacingS
                     model: root.filteredRepos
 
-                    delegate: StyledRect {
-                        id: repoSearchDelegate
+                    delegate: RepoItemDelegate {
                         width: repoSearchListView.width
-                        height: 52
-                        radius: Theme.cornerRadius
-
-                        property var repoData: modelData
-                        property bool repoExists: root.existingRepos[modelData.repoKey] === true
-                        property bool isCloning: root.activeClones[modelData.repoKey] === true
-                        property bool isSelected: index === popoutColumn.selectedIndex
-
-                        color: isSelected ? Theme.secondaryContainer :
-                               repoSearchMouse.containsMouse ? Theme.surfaceContainerHighest :
-                               Theme.surfaceContainerHigh
-
-                        border.width: isSelected ? 2 : 0
-                        border.color: Theme.secondary
-
-                        Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                        Behavior on border.width { NumberAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-
-                        Row {
-                            anchors.fill: parent
-                            anchors.margins: Theme.spacingM
-                            spacing: Theme.spacingM
-
-                            DankIcon {
-                                name: repoSearchDelegate.repoExists ? "check_circle" : (repoSearchDelegate.isCloning ? "sync" : "folder")
-                                size: Theme.iconSize
-                                color: repoSearchDelegate.repoExists ? Theme.primary : (repoSearchDelegate.isCloning ? Theme.secondary : Theme.surfaceVariantText)
-                                anchors.verticalCenter: parent.verticalCenter
-
-                                Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                                
-                                RotationAnimation on rotation {
-                                    running: repoSearchDelegate.isCloning
-                                    from: 0
-                                    to: 360
-                                    duration: 1000
-                                    loops: Animation.Infinite
-                                }
-                            }
-
-                            Column {
-                                anchors.verticalCenter: parent.verticalCenter
-                                spacing: 2
-                                width: parent.width - Theme.iconSize - cloneSearchIcon.width - Theme.spacingM * 2
-
-                                StyledText {
-                                    text: repoSearchDelegate.repoData.repoName + (repoSearchDelegate.isCloning ? " (cloning...)" : "")
-                                    font.pixelSize: Theme.fontSizeMedium
-                                    font.weight: Font.Medium
-                                    color: Theme.surfaceText
-                                    elide: Text.ElideMiddle
-                                    width: parent.width
-
-                                    Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                                }
-
-                                StyledText {
-                                    text: {
-                                        const h = repoSearchDelegate.repoData.hostname;
-                                        const aliases = root.hostAliasMap[h];
-                                        if (aliases && aliases.length > 0)
-                                            return h + "  ·  " + aliases.join(", ");
-                                        return h;
-                                    }
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    color: Theme.surfaceVariantText
-                                    elide: Text.ElideRight
-                                    width: parent.width
-
-                                    Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                                }
-                            }
-
-                            DankIcon {
-                                id: cloneSearchIcon
-                                visible: !repoSearchDelegate.repoExists && !repoSearchDelegate.isCloning
-                                name: "download"
-                                size: Theme.iconSize
-                                color: cloneSearchMouse.containsMouse ? Theme.primary : Theme.surfaceVariantText
-                                anchors.verticalCenter: parent.verticalCenter
-
-                                Behavior on color { ColorAnimation { duration: Theme.shortDuration; easing.type: Theme.standardEasing } }
-                                
-                                MouseArea {
-                                    id: cloneSearchMouse
-                                    anchors.fill: parent
-                                    anchors.margins: -Theme.spacingS
-                                    hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: (mouse) => {
-                                        mouse.accepted = true;
-                                        root.cloneGitRepo(repoSearchDelegate.repoData.hostname, repoSearchDelegate.repoData.repoName);
-                                    }
-                                }
-                            }
+                        repoName: modelData.repoName
+                        subtitle: {
+                            const h = modelData.hostname;
+                            const aliases = root.hostAliasMap[h];
+                            return (aliases && aliases.length > 0) ? h + "  \u00b7  " + aliases.join(", ") : h;
                         }
-
-                        MouseArea {
-                            id: repoSearchMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: (repoSearchDelegate.repoExists || repoSearchDelegate.isCloning) ? Qt.ArrowCursor : Qt.PointingHandCursor
-                            acceptedButtons: Qt.LeftButton
-                            
-                            onEntered: {
-                                popoutColumn.selectedIndex = index;
-                            }
-                            
-                            onClicked: {
-                                if (!repoSearchDelegate.repoExists && !repoSearchDelegate.isCloning) {
-                                    root.cloneGitRepo(repoSearchDelegate.repoData.hostname, repoSearchDelegate.repoData.repoName);
-                                }
-                            }
-                        }
+                        iconSize: Theme.iconSize
+                        rowSpacing: Theme.spacingM
+                        baseColor: Theme.surfaceContainerHigh
+                        repoExists: root.existingRepos[modelData.repoKey] === true
+                        isCloning: root.activeClones[modelData.repoKey] === true
+                        isSelected: index === popoutColumn.selectedIndex
+                        onCloneRequested: root.cloneGitRepo(modelData.hostname, modelData.repoName)
+                        onEntered: popoutColumn.selectedIndex = index
                     }
                     
                     // Empty state for repo search
@@ -1921,19 +1803,12 @@ PluginComponent {
                             anchors.centerIn: parent
                             spacing: Theme.spacingM
 
-                            DankIcon {
+                            SpinningIcon {
                                 name: root.isFetchingAllRepos ? "sync" : (root.repoSearchQuery ? "search_off" : "folder_open")
                                 size: 48
                                 color: Theme.surfaceVariantText
                                 anchors.horizontalCenter: parent.horizontalCenter
-                                
-                                RotationAnimation on rotation {
-                                    running: root.isFetchingAllRepos
-                                    from: 0
-                                    to: 360
-                                    duration: 1000
-                                    loops: Animation.Infinite
-                                }
+                                spinning: root.isFetchingAllRepos
                             }
 
                             StyledText {
